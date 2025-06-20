@@ -4,6 +4,7 @@ mod raft;
 mod storage;
 
 use std::sync::Arc;
+use std::collections::HashMap;
 use clap::Parser;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -45,9 +46,18 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting Raft KV server node {} on port {}", args.node_id, args.port);
     info!("Peers: {:?}", args.peers);
     
+    // Build peer addresses map
+    let mut peer_addresses = HashMap::new();
+    for &peer_id in &args.peers {
+        // Assuming peers are on sequential ports starting from 3001
+        let peer_port = 3000 + peer_id;
+        peer_addresses.insert(peer_id, format!("http://127.0.0.1:{}", peer_port));
+    }
+    
     let config = Config {
         node_id: args.node_id,
         peers: args.peers,
+        peer_addresses,
         ..Default::default()
     };
     

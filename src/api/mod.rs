@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use tracing::info;
 
 use crate::{
     error::{KvError, Result},
-    raft::RaftNode,
+    raft::{RaftNode, types::{RequestVoteRequest, RequestVoteResponse, AppendEntriesRequest, AppendEntriesResponse}},
 };
 
 #[derive(Clone)]
@@ -40,6 +40,8 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/key/:key", get(get_handler))
         .route("/key/:key", put(put_handler))
         .route("/status", get(status_handler))
+        .route("/raft/request_vote", post(request_vote_handler))
+        .route("/raft/append_entries", post(append_entries_handler))
         .with_state(state)
 }
 
@@ -104,4 +106,22 @@ impl IntoResponse for KvError {
         
         (status, Json(error_response)).into_response()
     }
+}
+
+async fn request_vote_handler(
+    State(state): State<ApiState>,
+    Json(request): Json<RequestVoteRequest>,
+) -> impl IntoResponse {
+    info!("Received RequestVote RPC from node {}", request.candidate_id);
+    let response = state.raft_node.handle_request_vote(request).await;
+    Json(response)
+}
+
+async fn append_entries_handler(
+    State(state): State<ApiState>,
+    Json(request): Json<AppendEntriesRequest>,
+) -> impl IntoResponse {
+    info!("Received AppendEntries RPC from leader {}", request.leader_id);
+    let response = state.raft_node.handle_append_entries(request).await;
+    Json(response)
 }

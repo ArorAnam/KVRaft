@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::storage::StorageCommand;
@@ -56,6 +57,7 @@ pub struct RequestVoteResponse {
 pub struct Config {
     pub node_id: NodeId,
     pub peers: Vec<NodeId>,
+    pub peer_addresses: HashMap<NodeId, String>,
     pub election_timeout_min_ms: u64,
     pub election_timeout_max_ms: u64,
     pub heartbeat_interval_ms: u64,
@@ -66,6 +68,7 @@ impl Default for Config {
         Self {
             node_id: 1,
             peers: vec![],
+            peer_addresses: HashMap::new(),
             election_timeout_min_ms: 150,
             election_timeout_max_ms: 300,
             heartbeat_interval_ms: 50,
