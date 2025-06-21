@@ -41,7 +41,7 @@ echo "=== Testing read operations ==="
 for key in key1 key2 key3; do
     echo "Reading $key from all nodes:"
     for port in 3001 3002 3003; do
-        echo -n "  Node $port: "
+        printf "  Node %s: " "$port"
         $CLIENT --server "http://127.0.0.1:$port" get $key
     done
     echo

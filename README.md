@@ -103,12 +103,50 @@ The system consists of:
    ./target/release/raft-kv-client --server http://127.0.0.1:3001 status
    ```
 
-## Current Limitations
+## Next Steps
 
-This is a basic implementation for educational purposes. Production features not included:
-- Persistent storage
+### 1. Log Replication (In Progress)
+- [ ] Implement AppendEntries RPC with actual log entries
+- [ ] Add log consistency checks (prev_log_index, prev_log_term)
+- [ ] Implement commit index advancement based on majority
+- [ ] Add catch-up mechanism for lagging followers
+
+### 2. Client Request Handling
+- [ ] Forward requests to leader when receiving on follower
+- [ ] Track client requests until committed and applied
+- [ ] Implement linearizable reads
+
+### 3. Persistence & Durability
+- [ ] Persist current term, voted for, and log entries
+- [ ] Restore state on node restart
+- [ ] Implement write-ahead logging
+
+### 4. Advanced Features
+- [ ] Snapshot support for log compaction
+- [ ] Dynamic membership changes
+- [ ] Pre-vote optimization
+- [ ] Batching and pipelining optimizations
+
+### 5. Testing & Reliability
+- [ ] Comprehensive test suite for edge cases
+- [ ] Network partition testing
+- [ ] Chaos testing / fault injection
+- [ ] Performance benchmarking
+
+## Current Status
+
+✅ **Completed**:
+- Basic Raft node structure
+- Leader election with proper voting
+- HTTP API for key-value operations
+- Multi-node configuration
+- Basic heartbeat mechanism
+
+🚧 **In Progress**:
+- Log replication
+
+❌ **Not Implemented**:
+- Persistence
 - Log compaction
 - Membership changes
-- Snapshots
-- Network partitions handling
-- Full Raft protocol (missing proper leader election voting, log replication to followers)
+- Proper client request forwarding

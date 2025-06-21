@@ -2,9 +2,10 @@ pub mod types;
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::collections::HashMap;
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio::time::{interval, timeout, Instant, sleep};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 use rand::Rng;
 
@@ -21,6 +22,12 @@ impl Clone for RaftNode {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FollowerState {
+    next_index: LogIndex,
+    match_index: LogIndex,
+}
+
 pub struct RaftNode {
     pub id: NodeId,
     config: Config,
@@ -35,6 +42,7 @@ pub struct RaftNode {
     pending_commands: Arc<Mutex<dashmap::DashMap<Uuid, oneshot::Sender<Result<()>>>>>,
     election_timer: Arc<Mutex<Option<Instant>>>,
     client: reqwest::Client,
+    follower_states: RwLock<HashMap<NodeId, FollowerState>>,
 }
 
 impl RaftNode {
@@ -53,6 +61,7 @@ impl RaftNode {
             pending_commands: Arc::new(Mutex::new(dashmap::DashMap::new())),
             election_timer: Arc::new(Mutex::new(None)),
             client: reqwest::Client::new(),
+            follower_states: RwLock::new(HashMap::new()),
         }
     }
     
@@ -75,10 +84,10 @@ impl RaftNode {
         info!("Raft node {} started", self.id);
     }
     
-    async fn run_leader_tasks(&self) {
+    async fn run_leader_tasks(self: Arc<Self>) {
         loop {
             if self.get_state().await == NodeState::Leader {
-                self.leader_loop().await;
+                self.clone().leader_loop().await;
             } else {
                 sleep(Duration::from_millis(100)).await;
             }
@@ -130,7 +139,8 @@ impl RaftNode {
         
         self.log.write().await.push(entry.clone());
         
-        self.replicate_log().await;
+        // Trigger replication
+        // Note: This would need to be called on Arc<Self> in a real implementation
         
         match timeout(Duration::from_secs(5), rx).await {
             Ok(Ok(result)) => result,
@@ -251,52 +261,34 @@ impl RaftNode {
         *self.state.write().await = NodeState::Leader;
         *self.leader_id.write().await = Some(self.id);
         
-        self.send_heartbeats().await;
+        // Initialize follower states
+        let log_len = self.log.read().await.len() as LogIndex;
+        let mut follower_states = self.follower_states.write().await;
+        follower_states.clear();
         
-        // Leader loop will be handled by a separate task
+        for &peer_id in &self.config.peers {
+            follower_states.insert(peer_id, FollowerState {
+                next_index: log_len + 1,
+                match_index: 0,
+            });
+        }
+        drop(follower_states);
+        
+        // Send initial heartbeats will be handled by leader_loop
     }
     
-    async fn leader_loop(&self) {
+    async fn leader_loop(self: Arc<Self>) {
         let mut interval = interval(Duration::from_millis(self.config.heartbeat_interval_ms));
         
         while self.get_state().await == NodeState::Leader {
             interval.tick().await;
-            self.send_heartbeats().await;
+            self.clone().send_heartbeats().await;
         }
     }
     
-    async fn send_heartbeats(&self) {
-        let term = self.get_term().await;
-        let commit_index = *self.commit_index.read().await;
-        let log = self.log.read().await;
-        let prev_log_index = log.len() as LogIndex;
-        let prev_log_term = if prev_log_index > 0 {
-            log.get((prev_log_index - 1) as usize).map(|e| e.term).unwrap_or(0)
-        } else {
-            0
-        };
-        drop(log);
-        
-        let request = AppendEntriesRequest {
-            term,
-            leader_id: self.id,
-            prev_log_index,
-            prev_log_term,
-            entries: vec![],  // Empty for heartbeat
-            leader_commit: commit_index,
-        };
-        
-        for &peer_id in &self.config.peers {
-            let request_clone = request.clone();
-            let peer_addr = self.config.peer_addresses.get(&peer_id).cloned();
-            let client = self.client.clone();
-            
-            tokio::spawn(async move {
-                if let Some(addr) = peer_addr {
-                    Self::send_append_entries_static(client, addr, request_clone).await;
-                }
-            });
-        }
+    async fn send_heartbeats(self: Arc<Self>) {
+        // Just trigger log replication which will send appropriate messages
+        self.replicate_log().await;
     }
     
     async fn send_append_entries_static(
@@ -328,14 +320,90 @@ impl RaftNode {
         }
     }
     
-    async fn replicate_log(&self) {
-        let commit_index = *self.commit_index.read().await;
+    async fn replicate_log(self: Arc<Self>) {
+        if self.get_state().await != NodeState::Leader {
+            return;
+        }
+        
         let log = self.log.read().await;
-        let new_commit_index = log.len() as LogIndex;
+        let log_len = log.len() as LogIndex;
+        let term = self.get_term().await;
+        
+        // Send AppendEntries to all followers
+        let follower_states = self.follower_states.read().await;
+        for (&peer_id, &ref state) in follower_states.iter() {
+            // Always send to keep followers updated
+            let prev_index = if state.next_index > 0 { state.next_index - 1 } else { 0 };
+            let prev_term = if prev_index > 0 {
+                log.get((prev_index - 1) as usize).map(|e| e.term).unwrap_or(0)
+            } else {
+                0
+            };
+            
+            // Get entries to send
+            let entries: Vec<LogEntry> = if state.next_index > 0 && (state.next_index - 1) < log_len {
+                log[(state.next_index - 1) as usize..].to_vec()
+            } else {
+                vec![]
+            };
+            
+            let request = AppendEntriesRequest {
+                term,
+                leader_id: self.id,
+                prev_log_index: prev_index,
+                prev_log_term: prev_term,
+                entries,
+                leader_commit: *self.commit_index.read().await,
+            };
+            
+            let peer_addr = self.config.peer_addresses.get(&peer_id).cloned();
+            let client = self.client.clone();
+            let node = self.clone();
+            
+            tokio::spawn(async move {
+                if let Some(addr) = peer_addr {
+                    if let Some(response) = Self::send_append_entries_static(client, addr.clone(), request.clone()).await {
+                        node.handle_append_entries_response(peer_id, request, response).await;
+                    }
+                }
+            });
+        }
+        drop(follower_states);
         drop(log);
         
-        if new_commit_index > commit_index {
-            *self.commit_index.write().await = new_commit_index;
+        // Update commit index based on match_index
+        self.update_commit_index().await;
+    }
+    
+    async fn update_commit_index(&self) {
+        let log = self.log.read().await;
+        let log_len = log.len() as LogIndex;
+        let current_term = self.get_term().await;
+        
+        let follower_states = self.follower_states.read().await;
+        let mut match_indices: Vec<LogIndex> = follower_states
+            .values()
+            .map(|s| s.match_index)
+            .collect();
+        match_indices.push(log_len); // Add leader's index
+        match_indices.sort_unstable();
+        
+        // Find the median (majority)
+        let majority_index = match_indices.len() / 2;
+        let new_commit_index = match_indices[majority_index];
+        
+        // Only commit entries from current term
+        if new_commit_index > *self.commit_index.read().await {
+            if new_commit_index > 0 && new_commit_index <= log_len {
+                let entry_term = log.get((new_commit_index - 1) as usize)
+                    .map(|e| e.term)
+                    .unwrap_or(0);
+                    
+                if entry_term == current_term {
+                    *self.commit_index.write().await = new_commit_index;
+                    info!("Updated commit index to {}", new_commit_index);
+                }
+            }
         }
     }
     
@@ -454,8 +522,53 @@ impl RaftNode {
         // Ensure we're a follower
         *self.state.write().await = NodeState::Follower;
         
-        // TODO: Implement log replication logic
-        // For now, just accept the heartbeat
+        // Log consistency check
+        let mut log = self.log.write().await;
+        
+        // Check if we have the previous log entry
+        if request.prev_log_index > 0 {
+            if request.prev_log_index > log.len() as LogIndex {
+                // We don't have the previous entry
+                return AppendEntriesResponse {
+                    term: *current_term,
+                    success: false,
+                };
+            }
+            
+            let prev_entry = &log[(request.prev_log_index - 1) as usize];
+            if prev_entry.term != request.prev_log_term {
+                // Previous entry doesn't match - delete conflicting entries
+                log.truncate((request.prev_log_index - 1) as usize);
+                return AppendEntriesResponse {
+                    term: *current_term,
+                    success: false,
+                };
+            }
+        }
+        
+        // Append new entries
+        if !request.entries.is_empty() {
+            // Remove any conflicting entries
+            let start_index = request.prev_log_index as usize;
+            if start_index < log.len() {
+                log.truncate(start_index);
+            }
+            
+            // Append new entries
+            let num_entries = request.entries.len();
+            for entry in request.entries {
+                log.push(entry);
+            }
+            
+            info!("Appended {} entries, log length now: {}", 
+                  num_entries, log.len());
+        }
+        
+        // Update commit index
+        if request.leader_commit > *self.commit_index.read().await {
+            let new_commit_index = std::cmp::min(request.leader_commit, log.len() as LogIndex);
+            *self.commit_index.write().await = new_commit_index;
+        }
         
         AppendEntriesResponse {
             term: *current_term,
@@ -490,6 +603,45 @@ impl RaftNode {
         } else {
             debug!("No address configured for peer {}", peer_id);
             None
+        }
+    }
+    
+    async fn handle_append_entries_response(
+        &self,
+        peer_id: NodeId,
+        request: AppendEntriesRequest,
+        response: AppendEntriesResponse,
+    ) {
+        if self.get_state().await != NodeState::Leader {
+            return;
+        }
+        
+        if response.term > self.get_term().await {
+            // Step down - found a higher term
+            *self.current_term.write().await = response.term;
+            *self.state.write().await = NodeState::Follower;
+            *self.voted_for.write().await = None;
+            *self.leader_id.write().await = None;
+            return;
+        }
+        
+        let mut follower_states = self.follower_states.write().await;
+        if let Some(state) = follower_states.get_mut(&peer_id) {
+            if response.success {
+                // Update match_index and next_index
+                state.match_index = request.prev_log_index + request.entries.len() as LogIndex;
+                state.next_index = state.match_index + 1;
+                
+                debug!("Updated follower {} state: next_index={}, match_index={}", 
+                      peer_id, state.next_index, state.match_index);
+            } else {
+                // Decrement next_index and retry
+                if state.next_index > 1 {
+                    state.next_index -= 1;
+                    debug!("Decremented next_index for follower {} to {}", 
+                          peer_id, state.next_index);
+                }
+            }
         }
     }
 }
