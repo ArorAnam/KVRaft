@@ -59,11 +59,27 @@ This starts a 3-node cluster on ports 3001, 3002, and 3003.
 
 ## Testing
 
-Run the test script to see the cluster in action:
-
+### Basic cluster test:
 ```bash
 ./test_cluster.sh
 ```
+
+### Leader election test:
+```bash
+./test_election.sh
+```
+
+### Log replication test:
+```bash
+./test_replication.sh
+```
+
+The replication test will:
+- Start a 3-node cluster
+- Elect a leader
+- Write multiple key-value pairs to the leader
+- Verify all nodes have replicated the data
+- Show replication logs
 
 ## API Endpoints
 
@@ -105,13 +121,13 @@ The system consists of:
 
 ## Next Steps
 
-### 1. Log Replication (In Progress)
-- [ ] Implement AppendEntries RPC with actual log entries
-- [ ] Add log consistency checks (prev_log_index, prev_log_term)
-- [ ] Implement commit index advancement based on majority
-- [ ] Add catch-up mechanism for lagging followers
+### 1. ~~Log Replication~~ ✅ COMPLETED
+- [x] Implement AppendEntries RPC with actual log entries
+- [x] Add log consistency checks (prev_log_index, prev_log_term)
+- [x] Implement commit index advancement based on majority
+- [x] Add catch-up mechanism for lagging followers
 
-### 2. Client Request Handling
+### 2. Client Request Handling (Next Priority)
 - [ ] Forward requests to leader when receiving on follower
 - [ ] Track client requests until committed and applied
 - [ ] Implement linearizable reads
@@ -140,13 +156,17 @@ The system consists of:
 - Leader election with proper voting
 - HTTP API for key-value operations
 - Multi-node configuration
-- Basic heartbeat mechanism
+- Heartbeat mechanism
+- **Log replication with consistency checks**
+- **Follower catch-up mechanism**
+- **Commit index advancement**
 
 🚧 **In Progress**:
-- Log replication
+- Client request handling improvements
 
 ❌ **Not Implemented**:
+- Request forwarding to leader
 - Persistence
 - Log compaction
 - Membership changes
-- Proper client request forwarding
+- Linearizable reads
