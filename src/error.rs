@@ -16,6 +16,12 @@ pub enum KvError {
     
     #[error("Network error: {0}")]
     Network(String),
+    
+    #[error("No leader elected")]
+    NoLeaderElected,
+    
+    #[error("Peer not found: {0}")]
+    PeerNotFound(u64),
 }
 
 pub type Result<T> = std::result::Result<T, KvError>;

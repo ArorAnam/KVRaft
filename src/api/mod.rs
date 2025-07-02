@@ -7,16 +7,53 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, debug};
 
 use crate::{
     error::{KvError, Result},
-    raft::{RaftNode, types::{RequestVoteRequest, RequestVoteResponse, AppendEntriesRequest, AppendEntriesResponse}},
+    raft::{RaftNode, types::{RequestVoteRequest, RequestVoteResponse, AppendEntriesRequest, AppendEntriesResponse, NodeState}},
 };
 
 #[derive(Clone)]
 pub struct ApiState {
     pub raft_node: Arc<RaftNode>,
+}
+
+impl ApiState {
+    async fn forward_to_leader(&self, method: &str, path: &str, body: Option<serde_json::Value>) -> Result<axum::response::Response> {
+        let leader_id = self.raft_node.get_leader_id().await
+            .ok_or_else(|| KvError::NoLeaderElected)?;
+        
+        debug!("Forwarding request to leader {}", leader_id);
+        
+        let leader_address = self.raft_node.get_peer_address(leader_id)
+            .ok_or_else(|| KvError::PeerNotFound(leader_id))?;
+        
+        let url = format!("{}{}", leader_address, path);
+        info!("Forwarding {} request to {}", method, url);
+        let client = reqwest::Client::new();
+        
+        let mut request = match method {
+            "GET" => client.get(&url),
+            "PUT" => client.put(&url),
+            _ => return Err(KvError::Internal("Unsupported method".to_string())),
+        };
+        
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        
+        let response = request.send().await
+            .map_err(|e| KvError::Network(e.to_string()))?;
+        
+        let status = StatusCode::from_u16(response.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        
+        let body = response.bytes().await
+            .map_err(|e| KvError::Network(e.to_string()))?;
+        
+        Ok((status, body).into_response())
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -65,8 +102,20 @@ async fn put_handler(
 ) -> Result<impl IntoResponse> {
     info!("PUT request for key: {} value: {}", key, payload.value);
     
+    // Check if we're the leader
+    let current_state = state.raft_node.get_state().await;
+    debug!("Current node state: {:?}", current_state);
+    
+    if current_state != NodeState::Leader {
+        // Forward to leader
+        info!("Node is not leader, forwarding request to leader");
+        let path = format!("/key/{}", key);
+        let body = serde_json::json!({ "value": payload.value });
+        return state.forward_to_leader("PUT", &path, Some(body)).await;
+    }
+    
     state.raft_node.set(key, payload.value).await?;
-    Ok(StatusCode::OK)
+    Ok(StatusCode::OK.into_response())
 }
 
 async fn status_handler(State(state): State<ApiState>) -> impl IntoResponse {

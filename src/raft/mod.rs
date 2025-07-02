@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::collections::HashMap;
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio::time::{interval, timeout, Instant, sleep};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 use rand::Rng;
 
@@ -104,6 +104,10 @@ impl RaftNode {
     
     pub async fn get_leader_id(&self) -> Option<NodeId> {
         *self.leader_id.read().await
+    }
+    
+    pub fn get_peer_address(&self, node_id: NodeId) -> Option<String> {
+        self.config.peer_addresses.get(&node_id).cloned()
     }
     
     pub async fn get(&self, key: &str) -> Result<Option<String>> {
