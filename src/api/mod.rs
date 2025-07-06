@@ -11,7 +11,7 @@ use tracing::{info, debug};
 
 use crate::{
     error::{KvError, Result},
-    raft::{RaftNode, types::{RequestVoteRequest, RequestVoteResponse, AppendEntriesRequest, AppendEntriesResponse, NodeState}},
+    raft::{RaftNode, types::{RequestVoteRequest, RequestVoteResponse, AppendEntriesRequest, AppendEntriesResponse, NodeState, ClientId, RequestId}},
 };
 
 #[derive(Clone)]
@@ -64,6 +64,14 @@ pub struct GetResponse {
 #[derive(Serialize, Deserialize)]
 pub struct PutRequest {
     pub value: String,
+    pub client_id: Option<ClientId>,
+    pub request_id: Option<RequestId>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PutResponse {
+    pub success: bool,
+    pub message: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -110,12 +118,22 @@ async fn put_handler(
         // Forward to leader
         info!("Node is not leader, forwarding request to leader");
         let path = format!("/key/{}", key);
-        let body = serde_json::json!({ "value": payload.value });
+        let body = serde_json::json!({ 
+            "value": payload.value,
+            "client_id": payload.client_id,
+            "request_id": payload.request_id
+        });
         return state.forward_to_leader("PUT", &path, Some(body)).await;
     }
     
-    state.raft_node.set(key, payload.value).await?;
-    Ok(StatusCode::OK.into_response())
+    // Use the enhanced set method with client session support
+    state.raft_node.set_with_session(key, payload.value, payload.client_id, payload.request_id).await?;
+    
+    let response = PutResponse {
+        success: true,
+        message: Some("Value successfully stored".to_string()),
+    };
+    Ok(Json(response).into_response())
 }
 
 async fn status_handler(State(state): State<ApiState>) -> impl IntoResponse {

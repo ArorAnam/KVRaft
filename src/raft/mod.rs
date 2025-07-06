@@ -15,6 +15,7 @@ use crate::{
 };
 
 use self::types::*;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 impl Clone for RaftNode {
     fn clone(&self) -> Self {
@@ -40,6 +41,7 @@ pub struct RaftNode {
     leader_id: RwLock<Option<NodeId>>,
     storage: Storage,
     pending_commands: Arc<Mutex<dashmap::DashMap<Uuid, oneshot::Sender<Result<()>>>>>,
+    client_sessions: Arc<Mutex<HashMap<ClientRequestKey, ClientRequestInfo>>>,
     election_timer: Arc<Mutex<Option<Instant>>>,
     client: reqwest::Client,
     follower_states: RwLock<HashMap<NodeId, FollowerState>>,
@@ -59,6 +61,7 @@ impl RaftNode {
             leader_id: RwLock::new(None),
             storage,
             pending_commands: Arc::new(Mutex::new(dashmap::DashMap::new())),
+            client_sessions: Arc::new(Mutex::new(HashMap::new())),
             election_timer: Arc::new(Mutex::new(None)),
             client: reqwest::Client::new(),
             follower_states: RwLock::new(HashMap::new()),
@@ -115,10 +118,50 @@ impl RaftNode {
     }
     
     pub async fn set(&self, key: String, value: String) -> Result<()> {
+        self.set_with_session(key, value, None, None).await
+    }
+    
+    pub async fn set_with_session(&self, key: String, value: String, client_id: Option<ClientId>, request_id: Option<RequestId>) -> Result<()> {
         let state = self.get_state().await;
         if state != NodeState::Leader {
             let leader_id = self.get_leader_id().await;
             return Err(KvError::NotLeader { leader_id });
+        }
+        
+        // Handle client session and deduplication
+        if let (Some(cid), Some(rid)) = (client_id, request_id) {
+            let request_key = (cid, rid);
+            let mut sessions = self.client_sessions.lock().await;
+            
+            // Check if this request has already been processed
+            if let Some(existing_request) = sessions.get(&request_key) {
+                if existing_request.completed {
+                    // Request already completed, return success (deduplication)
+                    info!("Duplicate request detected for client {} request {}, returning cached result", cid, rid);
+                    return Ok(());
+                }
+                // If not completed, let it proceed normally (this handles retries)
+            }
+            
+            // Create client session entry
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+                
+            let session = ClientSession {
+                client_id: cid,
+                request_id: rid,
+                timestamp,
+            };
+            
+            let request_info = ClientRequestInfo {
+                session: session.clone(),
+                result: None,
+                completed: false,
+            };
+            
+            sessions.insert(request_key, request_info);
         }
         
         let command = StorageCommand {
@@ -126,19 +169,35 @@ impl RaftNode {
             value: Some(value),
         };
         
-        let client_id = Uuid::new_v4();
+        let internal_client_id = Uuid::new_v4();
         let (tx, rx) = oneshot::channel();
         
         {
             let pending = self.pending_commands.lock().await;
-            pending.insert(client_id, tx);
+            pending.insert(internal_client_id, tx);
         }
+        
+        // Create client session if provided
+        let client_session = if let (Some(cid), Some(rid)) = (client_id, request_id) {
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            Some(ClientSession {
+                client_id: cid,
+                request_id: rid,
+                timestamp,
+            })
+        } else {
+            None
+        };
         
         let entry = LogEntry {
             index: self.log.read().await.len() as LogIndex + 1,
             term: self.get_term().await,
             command,
-            client_id,
+            client_id: internal_client_id,
+            client_session,
         };
         
         self.log.write().await.push(entry.clone());
@@ -426,8 +485,39 @@ impl RaftNode {
                 for i in (*last_applied as usize)..=(commit_index as usize - 1) {
                     if i < log.len() {
                         let entry = &log[i];
+                        
+                        // Apply the command to storage
                         self.storage.apply_command(&entry.command);
                         
+                        // Handle client session if present
+                        if let Some(ref client_session) = entry.client_session {
+                            let request_key = (client_session.client_id, client_session.request_id);
+                            let mut sessions = self.client_sessions.lock().await;
+                            
+                            // Update the client session to mark it as completed
+                            if let Some(request_info) = sessions.get_mut(&request_key) {
+                                request_info.completed = true;
+                                // Store the result for deduplication (success result)
+                                request_info.result = Some("success".to_string());
+                                
+                                debug!("Marked client session as completed: client_id={}, request_id={}", 
+                                      client_session.client_id, client_session.request_id);
+                            } else {
+                                // Create a new completed session entry if it doesn't exist
+                                // This can happen if the entry was replicated to a follower
+                                let request_info = ClientRequestInfo {
+                                    session: client_session.clone(),
+                                    result: Some("success".to_string()),
+                                    completed: true,
+                                };
+                                sessions.insert(request_key, request_info);
+                                
+                                debug!("Created completed client session entry: client_id={}, request_id={}", 
+                                      client_session.client_id, client_session.request_id);
+                            }
+                        }
+                        
+                        // Notify pending commands (for internal client_id tracking)
                         let pending = self.pending_commands.lock().await;
                         if let Some((_, tx)) = pending.remove(&entry.client_id) {
                             let _ = tx.send(Ok(()));

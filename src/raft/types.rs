@@ -7,6 +7,8 @@ use crate::storage::StorageCommand;
 pub type Term = u64;
 pub type LogIndex = u64;
 pub type NodeId = u64;
+pub type ClientId = u64;
+pub type RequestId = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeState {
@@ -21,7 +23,25 @@ pub struct LogEntry {
     pub term: Term,
     pub command: StorageCommand,
     pub client_id: Uuid,
+    pub client_session: Option<ClientSession>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientSession {
+    pub client_id: ClientId,
+    pub request_id: RequestId,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientRequestInfo {
+    pub session: ClientSession,
+    pub result: Option<String>, // Store the result for deduplication
+    pub completed: bool,
+}
+
+// Key for tracking client requests (client_id, request_id)
+pub type ClientRequestKey = (ClientId, RequestId);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendEntriesRequest {
